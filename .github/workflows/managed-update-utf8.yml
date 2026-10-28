@@ -15,12 +15,17 @@ on:
         description: Earlier version used to build the reviewed driver package
         required: true
         default: "2026.10.9"
+      artifacts_run_id:
+        description: Reuse the proof artifacts of an earlier run instead of rebuilding
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   build-artifacts:
+    if: ${{ inputs.artifacts_run_id == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -82,6 +87,7 @@ jobs:
 
   proof:
     needs: build-artifacts
+    if: ${{ !cancelled() && (inputs.artifacts_run_id != '' || needs.build-artifacts.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:
@@ -101,11 +107,25 @@ jobs:
         with:
           node-version: 24.22.1
 
-      - name: Download proof artifacts
+      - name: Download proof artifacts (this run)
+        if: ${{ inputs.artifacts_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           name: proof-artifacts
-          path: /tmp/proof-artifacts
+          path: /tmp/proof-download
+
+      - name: Download proof artifacts (earlier run)
+        if: ${{ inputs.artifacts_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "${{ inputs.artifacts_run_id }}" --repo "$GITHUB_REPOSITORY" --name proof-artifacts -D /tmp/proof-download
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p /tmp/proof-artifacts
+          cp /tmp/proof-download/pkg-candidate/* /tmp/proof-artifacts/
+          cp /tmp/proof-download/pkg-driver/* /tmp/proof-artifacts/
+          ls -l /tmp/proof-artifacts
 
       - name: Start the systemd user manager
         run: |
