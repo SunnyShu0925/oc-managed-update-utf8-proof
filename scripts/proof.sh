@@ -15,7 +15,7 @@ set -uo pipefail
 SCENARIO="${SCENARIO:-fix}"
 STABLE="${STABLE_VERSION:-2026.10.8}"
 BASE_TARGET="${BASE_TARGET_VERSION:-2026.10.10-beta.3}"
-FIX_TARGET="${FIX_TARGET_VERSION:-2026.10.10-beta.4}"
+FIX_TARGET="${FIX_TARGET_VERSION:-2026.10.10}"
 CAND="${CAND_VERSION:-2026.10.9}"
 ASSET_BASE="${ASSET_BASE:-https://github.com/SunnyShu0925/oc-managed-update-utf8-proof/releases/download/v1}"
 PORT="${GATEWAY_PORT:-18833}"
@@ -57,12 +57,30 @@ note "scenario=$SCENARIO driver=$DRIVER_LABEL target=$TARGET"
 say "install the driver: $DRIVER_LABEL"
 if [ "$SCENARIO" = "fix" ]; then
   curl -fsSL -o "$WORK/cand.tgz" "$ASSET_BASE/openclaw-$CAND.tgz"
-  sha256sum "$WORK/cand.tgz" | tee -a "$SUMMARY"
+  curl -fsSL -o "$WORK/target.tgz" "$ASSET_BASE/openclaw-$TARGET.tgz"
+  sha256sum "$WORK/cand.tgz" "$WORK/target.tgz" | tee -a "$SUMMARY"
   FIX_MARKERS=$(tar -xzOf "$WORK/cand.tgz" --wildcards 'package/dist/update-managed-service-handoff-current-*.mjs' |
     grep -c "retained a lossy copy")
   INV=$(tar -xzOf "$WORK/cand.tgz" package/dist/postinstall-inventory.json 2>/dev/null | head -c 1)
   note "reviewed build fix markers in shipped dist: $FIX_MARKERS"
   note "reviewed build dist inventory present: ${INV:+yes}"
+  tar -xzOf "$WORK/target.tgz" package/package.json >"$WORK/target-manifest.json"
+  PROOF_REGISTRY_PORT=48771 PROOF_TARBALL="$WORK/target.tgz" \
+  PROOF_CANDIDATE_VERSION="$TARGET" PROOF_BASE_VERSION="$STABLE" \
+  PROOF_CANDIDATE_MANIFEST="$WORK/target-manifest.json" PROOF_REGISTRY_LOG=/tmp/registry.log \
+    node scripts/registry-proxy.mjs >/tmp/registry.out 2>&1 &
+  for _ in $(seq 1 60); do
+    curl -sf -o /dev/null "http://127.0.0.1:48771/openclaw" && break
+    sleep 1
+  done
+  curl -s "http://127.0.0.1:48771/openclaw" | node -e '
+let raw = "";
+process.stdin.on("data", (chunk) => (raw += chunk)).on("end", () => {
+  const doc = JSON.parse(raw);
+  const version = doc["dist-tags"].latest;
+  console.log(`registry latest=${version} schemaVersions=${JSON.stringify(doc.versions[version].openclaw?.schemaVersions)}`);
+});
+' | tee -a "$SUMMARY"
   npm install -g "$WORK/cand.tgz" --no-audit --no-fund 2>&1 | tail -3
 else
   npm install -g "openclaw@$STABLE" --no-audit --no-fund 2>&1 | tail -3
@@ -144,9 +162,15 @@ console.log(`cron before: ${list.length} job(s) ${list.map((job) => job.name ?? 
 say "RUN: $DRIVER_LABEL -> published $TARGET"
 OUT=/tmp/update.json
 SCRIPT=/tmp/run-update.sh
+REGISTRY_ENV=""
+if [ "$SCENARIO" = "fix" ]; then
+  REGISTRY_ENV='export NPM_CONFIG_REGISTRY="http://127.0.0.1:48771"
+export OPENCLAW_UPDATE_PACKAGE_SPEC=openclaw'
+fi
 cat >"$SCRIPT" <<SH
 #!/bin/bash
 echo "[\$(date -u +%FT%TZ)] scheduled update start -> $TARGET" >>"$INJECT_LOG"
+$REGISTRY_ENV
 "$OPENCLAW" update --yes --json --tag "$TARGET" --timeout 1200 >"$OUT" 2>"$OUT.err"
 echo \$? >"$OUT.rc"
 SH

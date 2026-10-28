@@ -18,7 +18,7 @@ on:
       fix_target_version:
         description: Published target for the reviewed-driver scenario
         required: true
-        default: "2026.10.10-beta.4"
+        default: "2026.10.10"
 
 permissions:
   contents: read
