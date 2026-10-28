@@ -84,4 +84,10 @@ jobs:
             /tmp/proof-summary.txt
             /tmp/registry-a.log
             /tmp/registry-b.log
+            /tmp/inject-gateway.log
+            /tmp/handoff-runA.log
+            /tmp/handoff-runB.log
+            /tmp/cron-add-runA.err
+            /tmp/cron-add-runB.err
+            /home/runner/.openclaw/update-reports/*.md
           if-no-files-found: warn

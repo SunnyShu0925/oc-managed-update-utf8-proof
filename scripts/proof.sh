@@ -6,9 +6,10 @@
 #   Run B: installed candidate 2026.10.9 (driver with the fix)  -> 2026.10.10
 #
 # Both updates are started from a cron command job, so the updater runs inside the
-# Gateway process tree exactly like a scheduled update. A NODE_OPTIONS preload adds
-# one raw 0xFF byte to the managed updater's --json stdout, so the handoff decoder
-# is the only thing that differs between the two drivers.
+# Gateway process tree exactly like a scheduled update and uses the shipped
+# managed-service handoff. A preload in the Gateway environment adds one raw 0xFF
+# byte to the handoff updater's stdout, so the handoff decoder is the only thing
+# that differs between the two drivers.
 set -uo pipefail
 
 STABLE="${STABLE_VERSION:-2026.10.8}"
@@ -19,8 +20,10 @@ PORT=18833
 TOKEN=proof-token-186033
 WORK=/tmp/proof186033
 SUMMARY=/tmp/proof-summary.txt
+INJECT_LOG=/tmp/inject-gateway.log
 mkdir -p "$WORK"
 : >"$SUMMARY"
+: >"$INJECT_LOG"
 
 say() { echo; echo "=== $* ==="; }
 note() { echo "$*" | tee -a "$SUMMARY"; }
@@ -111,11 +114,33 @@ wait_gateway_running() {
   done
   return 1
 }
+wait_gateway_rpc() {
+  for _ in $(seq 1 120); do
+    "$OPENCLAW" cron list --json >/tmp/cron-probe.json 2>/dev/null && return 0
+    sleep 2
+  done
+  return 1
+}
 wait_gateway_running && note "gateway service: running" || note "gateway service: NOT running"
+wait_gateway_rpc && note "gateway RPC: ready" || note "gateway RPC: NOT ready"
 systemctl --user show openclaw-gateway.service -p ActiveState -p SubState -p MainPID | tee -a "$SUMMARY"
 
+say "attach the proof preload to the Gateway service environment"
+mkdir -p "$HOME/.config/systemd/user/openclaw-gateway.service.d"
+cat >"$HOME/.config/systemd/user/openclaw-gateway.service.d/proof-inject.conf" <<CONF
+[Service]
+Environment=NODE_OPTIONS=--import file://$GITHUB_WORKSPACE/scripts/inject-utf8.mjs
+Environment=PROOF_INJECT_LOG=$INJECT_LOG
+CONF
+systemctl --user daemon-reload
+systemctl --user restart openclaw-gateway
+sleep 3
+wait_gateway_running && note "gateway restarted with the preload" || note "gateway restart: NOT running"
+wait_gateway_rpc && note "gateway RPC after restart: ready" || note "gateway RPC after restart: NOT ready"
+systemctl --user show openclaw-gateway.service -p ActiveState -p MainPID | tee -a "$SUMMARY"
+
 say "seed a cron data marker through the shipped CLI"
-"$OPENCLAW" cron add --name proof-data --every 1d --agent main --message "proof turn" --json 2>&1 | tail -2
+"$OPENCLAW" cron add --name proof-data --every 1d --agent main --message "proof turn" --json 2>&1 | tail -3
 "$OPENCLAW" cron list --json >/tmp/cron-before.json 2>/dev/null || true
 node -e '
 const jobs = require("/tmp/cron-before.json");
@@ -132,27 +157,33 @@ run_scheduled_update() {
   local script="/tmp/run-update-$label.sh"
   cat >"$script" <<SH
 #!/bin/bash
-export NODE_OPTIONS="--import file://$GITHUB_WORKSPACE/scripts/inject-utf8.mjs"
-export PROOF_INJECT_LOG="/tmp/inject-$label.log"
+echo "[\$(date -u +%FT%TZ)] $label scheduled update start" >>"$INJECT_LOG"
 export NPM_CONFIG_REGISTRY="http://127.0.0.1:$registry"
 export OPENCLAW_UPDATE_PACKAGE_SPEC=openclaw
 "$OPENCLAW" update --yes --json --timeout 1200 >"$out" 2>"$out.err"
 echo \$? >"$out.rc"
 SH
   chmod +x "$script"
-  : >"/tmp/inject-$label.log"
   rm -f "$out" "$out.err" "$out.rc"
-  local job_id
-  job_id=$("$OPENCLAW" cron add --name "proof-update-$label" --cron "0 0 1 1 *" \
-    --command "bash $script" --json 2>/dev/null |
-    node -e 'let raw="";process.stdin.on("data",(d)=>raw+=d).on("end",()=>{try{const j=JSON.parse(raw);console.log(j.id??j.job?.id??"")}catch{console.log("")}})')
+  local job_id=""
+  for _ in $(seq 1 30); do
+    job_id=$("$OPENCLAW" cron add --name "proof-update-$label" --cron "0 0 1 1 *" \
+      --command "bash $script" --json 2>/tmp/cron-add-$label.err |
+      node -e 'let raw="";process.stdin.on("data",(d)=>raw+=d).on("end",()=>{try{const j=JSON.parse(raw);console.log(j.id??j.job?.id??"")}catch{console.log("")}})')
+    [ -n "$job_id" ] && break
+    sleep 5
+  done
   note "$label cron job id: ${job_id:-none}"
-  local before_dir
+  if [ -z "$job_id" ]; then
+    tail -5 "/tmp/cron-add-$label.err" | tee -a "$SUMMARY"
+    return 1
+  fi
+  local before_dir before_report
   before_dir=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
+  before_report=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
   "$OPENCLAW" cron run "$job_id" --json 2>&1 | tail -3
-  # Wait for the handoff helper to settle; the Gateway restarts during activation.
   local handoff=""
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 100); do
     sleep 5
     handoff=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
     if [ -n "$handoff" ] && [ "$handoff" != "$before_dir" ] &&
@@ -165,14 +196,24 @@ SH
     WARN_LINES=$(grep -c 'invalid UTF-8' "$handoff/handoff.log" 2>/dev/null | head -1)
     note "$label handoff invalid-UTF-8 lines: ${WARN_LINES:-0}"
     grep 'invalid UTF-8' "$handoff/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
-    grep -E 'ownership transferred|starting managed update command|update command pid|update command exited|helper completed' \
-      "$handoff/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
+    echo "--- $label handoff.log (command and completion) ---"
+    grep -E 'ownership transferred|starting managed update command|update command pid|update command exited|helper completed|Saved update|Exited with code|reason' \
+      "$handoff/handoff.log" 2>/dev/null | tail -20 | tee -a "$SUMMARY"
+    echo "--- $label handoff.log tail ---"
+    tail -25 "$handoff/handoff.log" 2>/dev/null | cut -c1-300 | tee -a "$SUMMARY"
+    cp "$handoff/handoff.log" "/tmp/handoff-$label.log" 2>/dev/null || true
   fi
   echo "--- $label injector log ---"
-  cat "/tmp/inject-$label.log" 2>/dev/null | tee -a "$SUMMARY"
+  cat "$INJECT_LOG" 2>/dev/null | tail -20 | tee -a "$SUMMARY"
   echo "--- $label update output ---"
-  cat "$out" 2>/dev/null | tail -20
+  cat "$out" 2>/dev/null | tail -12
   echo "--- $label rc: $(cat "$out.rc" 2>/dev/null || echo missing) ---"
+  local report
+  report=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
+  if [ -n "$report" ] && [ "$report" != "$before_report" ]; then
+    echo "--- $label update report ($report) ---"
+    head -20 "$report" | tee -a "$SUMMARY"
+  fi
   wait_gateway_running && note "$label gateway service: running" || note "$label gateway service: NOT running"
 }
 
@@ -208,7 +249,6 @@ node -e '
 const s = require("/tmp/gateway-status-after.json");
 console.log(`service after=${s?.service?.runtime?.status} version=${s?.service?.runtime?.version ?? s?.rpc?.version ?? "n/a"} pid=${s?.service?.runtime?.pid ?? "n/a"}`);
 ' | tee -a "$SUMMARY"
-ls -lt "$HOME"/.openclaw/update-reports 2>/dev/null | head -4 | tee -a "$SUMMARY"
 
 say "verdict"
 A_OK=no
