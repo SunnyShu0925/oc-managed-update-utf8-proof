@@ -107,7 +107,7 @@ note "settings sha256: $(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d' ' -
 say "install and start the managed gateway service"
 "$OPENCLAW" gateway install --port "$PORT" --token "$TOKEN" --json 2>&1 | tail -4
 wait_gateway_running() {
-  for _ in $(seq 1 150); do
+  for _ in $(seq 1 90); do
     "$OPENCLAW" gateway status --json >/tmp/gateway-status.json 2>/dev/null || true
     node -e 'const s=require("/tmp/gateway-status.json");process.exit(s?.service?.runtime?.status==="running"?0:1)' 2>/dev/null && return 0
     sleep 2
@@ -129,13 +129,19 @@ say "attach the proof preload to the Gateway service environment"
 mkdir -p "$HOME/.config/systemd/user/openclaw-gateway.service.d"
 cat >"$HOME/.config/systemd/user/openclaw-gateway.service.d/proof-inject.conf" <<CONF
 [Service]
-Environment=NODE_OPTIONS=--import file://$GITHUB_WORKSPACE/scripts/inject-utf8.mjs
-Environment=PROOF_INJECT_LOG=$INJECT_LOG
+Environment="NODE_OPTIONS=--import file://$GITHUB_WORKSPACE/scripts/inject-utf8.mjs"
+Environment="PROOF_INJECT_LOG=$INJECT_LOG"
 CONF
 systemctl --user daemon-reload
+systemctl --user show openclaw-gateway.service -p Environment | tr ' ' '\n' | grep -E "NODE_OPTIONS|PROOF_INJECT_LOG" | tee -a "$SUMMARY"
 systemctl --user restart openclaw-gateway
 sleep 3
-wait_gateway_running && note "gateway restarted with the preload" || note "gateway restart: NOT running"
+if ! wait_gateway_running; then
+  note "gateway restart: NOT running"
+  journalctl --user -u openclaw-gateway --no-pager -n 40 2>&1 | tail -40 | tee -a "$SUMMARY"
+  exit 1
+fi
+note "gateway restarted with the preload"
 wait_gateway_rpc && note "gateway RPC after restart: ready" || note "gateway RPC after restart: NOT ready"
 systemctl --user show openclaw-gateway.service -p ActiveState -p MainPID | tee -a "$SUMMARY"
 
