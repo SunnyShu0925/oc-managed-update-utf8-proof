@@ -40,9 +40,9 @@ if [ "$SCENARIO" = "stable-driver" ]; then
 else
   DRIVER_LABEL="reviewed driver $DRIVER (has the fix)"
   DRIVER_MODE=tarball
-  USE_REGISTRY=0
+  USE_REGISTRY=1
   EXPECT_WARN=1
-  EXPECT_TARGET_BUILD=""
+  EXPECT_TARGET_BUILD="$EXPECT_BUILD_ID"
 fi
 
 say() { echo; echo "=== $* ==="; }
@@ -76,11 +76,22 @@ tar -xzf "$CAND_TARBALL" -C "$WORK" && mv "$WORK/package" "$WORK/cand-root"
 CAND_VERSION_ACTUAL=$(node -e 'console.log(require(process.argv[1]).version)' "$WORK/cand-root/package.json")
 note "candidate package version: $CAND_VERSION_ACTUAL"
 
-say "candidate executor probe (shipped entrypoint, closed stdin)"
-( cd "$WORK/cand-root" && node dist/cli/daemon-cli.js gateway install --update-executor check --json </dev/null ) \
+say "candidate staged install probe (npm install + shipped entrypoint)"
+rm -rf "$WORK/stage" && mkdir -p "$WORK/stage"
+npm install --prefix "$WORK/stage" --no-audit --no-fund "$CAND_TARBALL" >/dev/null 2>&1
+note "staged install rc=$?"
+( cd "$WORK/stage/node_modules/openclaw" &&
+  node dist/index.js gateway install --update-executor check --json </dev/null ) \
   >"$WORK/cand-probe.json" 2>"$WORK/cand-probe.err"
-note "candidate executor probe rc=$?"
-head -c 400 "$WORK/cand-probe.json" | tee -a "$SUMMARY"
+note "candidate probe (clean env) rc=$?"
+head -c 300 "$WORK/cand-probe.json" | tee -a "$SUMMARY"
+echo
+( cd "$WORK/stage/node_modules/openclaw" &&
+  NODE_OPTIONS="--import file://$GITHUB_WORKSPACE/scripts/inject-utf8.mjs" PROOF_INJECT_LOG="$INJECT_LOG" \
+  node dist/index.js gateway install --update-executor check --json </dev/null ) \
+  >"$WORK/cand-probe-preload.json" 2>"$WORK/cand-probe-preload.err"
+note "candidate probe (proof preload env) rc=$?"
+head -c 300 "$WORK/cand-probe-preload.json" | tee -a "$SUMMARY"
 echo
 
 if [ "$USE_REGISTRY" = "1" ]; then

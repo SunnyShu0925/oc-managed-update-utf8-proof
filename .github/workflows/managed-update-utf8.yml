@@ -178,4 +178,5 @@ jobs:
             /tmp/registry.log
             /tmp/registry.out
             /home/runner/.openclaw/update-reports/*.md
+            /home/runner/.openclaw/logs/support/*.json
           if-no-files-found: warn
