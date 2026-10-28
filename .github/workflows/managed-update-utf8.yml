@@ -7,14 +7,18 @@ on:
         description: Published driver version to upgrade from
         required: true
         default: "2026.10.8"
-      candidate_a_version:
-        description: Reviewed candidate version (first upgrade target)
+      candidate_version:
+        description: Reviewed driver build version
         required: true
         default: "2026.10.9"
-      candidate_b_version:
-        description: Follow-up candidate version (second upgrade target)
+      base_target_version:
+        description: Published target for the baseline run
         required: true
-        default: "2026.10.10"
+        default: "2026.10.10-beta.3"
+      fix_target_version:
+        description: Published target for the reviewed-driver run
+        required: true
+        default: "2026.10.10-beta.4"
 
 permissions:
   contents: read
@@ -59,8 +63,9 @@ jobs:
       - name: Run the published-driver to candidate managed upgrades
         env:
           STABLE_VERSION: ${{ inputs.stable_version }}
-          CAND_A_VERSION: ${{ inputs.candidate_a_version }}
-          CAND_B_VERSION: ${{ inputs.candidate_b_version }}
+          CAND_VERSION: ${{ inputs.candidate_version }}
+          BASE_TARGET_VERSION: ${{ inputs.base_target_version }}
+          FIX_TARGET_VERSION: ${{ inputs.fix_target_version }}
         run: bash "$GITHUB_WORKSPACE/scripts/proof.sh"
 
       - name: Upload proof logs
