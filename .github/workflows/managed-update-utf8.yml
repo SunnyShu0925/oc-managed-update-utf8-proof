@@ -1,0 +1,81 @@
+name: managed-update-utf8-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      stable_version:
+        description: Published driver version to upgrade from
+        required: true
+        default: "2026.10.8"
+      candidate_a_version:
+        description: Reviewed candidate version (first upgrade target)
+        required: true
+        default: "2026.10.9"
+      candidate_b_version:
+        description: Follow-up candidate version (second upgrade target)
+        required: true
+        default: "2026.10.10"
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout proof harness
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24.22.1
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+
+      - name: Start the systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+          echo "npm_config_prefix=$HOME/.npm-global" >> "$GITHUB_ENV"
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+          systemctl --user is-system-running || true
+          systemctl --user start dbus.socket 2>/dev/null || true
+          systemctl --user is-active dbus.socket 2>/dev/null || true
+          sleep 2
+          busctl --user list | head -5 || true
+
+      - name: Report reviewed build identity
+        run: |
+          echo "proof harness head: $(git rev-parse HEAD)"
+          curl -fsSL "$GITHUB_API_URL/repos/SunnyShu0925/openclaw/commits/fix/update-managed-service-handoff-lossy-utf8" \
+            | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const c=JSON.parse(s);console.log(`reviewed PR head: ${c.sha} ${c.commit?.message?.split("\n")[0]}`)})'
+
+      - name: Run the published-driver to candidate managed upgrades
+        env:
+          STABLE_VERSION: ${{ inputs.stable_version }}
+          CAND_A_VERSION: ${{ inputs.candidate_a_version }}
+          CAND_B_VERSION: ${{ inputs.candidate_b_version }}
+        run: bash "$GITHUB_WORKSPACE/scripts/proof.sh"
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-logs
+          path: |
+            /tmp/update-a.json
+            /tmp/update-a.err
+            /tmp/update-b.json
+            /tmp/update-b.err
+            /tmp/inject-a.log
+            /tmp/inject-b.log
+            /tmp/gateway-status.json
+            /tmp/gateway-status-after.json
+            /tmp/cron-before.json
+            /tmp/cron-after.json
+            /tmp/proof-summary.txt
+            /tmp/registry-a.log
+            /tmp/registry-b.log
+          if-no-files-found: warn
