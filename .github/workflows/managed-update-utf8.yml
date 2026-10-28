@@ -57,32 +57,50 @@ jobs:
         env:
           TARGET_VERSION: ${{ inputs.candidate_version }}
 
-      - name: Build the reviewed driver package
-        run: |
-          node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.version=process.env.DRIVER_VERSION;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
-          node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog \
-            --output-dir "$RUNNER_TEMP/pkg-driver" --output-name "openclaw-$DRIVER_VERSION.tgz"
-          git checkout -- package.json
-          ls -l "$RUNNER_TEMP/pkg-candidate" "$RUNNER_TEMP/pkg-driver"
-        env:
-          DRIVER_VERSION: ${{ inputs.driver_version }}
-
       - name: Record the reviewed build identity
         run: |
           git rev-parse --short=7 HEAD > "$RUNNER_TEMP/reviewed-build-id.txt"
           cat "$RUNNER_TEMP/reviewed-build-id.txt"
           cp "$RUNNER_TEMP/reviewed-build-id.txt" "$RUNNER_TEMP/pkg-candidate/"
-          cp "$RUNNER_TEMP/reviewed-build-id.txt" "$RUNNER_TEMP/pkg-driver/"
+
+      - name: Package the reviewed candidate as a self-contained install
+        run: |
+          rm -rf "$RUNNER_TEMP/sc" "$RUNNER_TEMP/scpkg" "$RUNNER_TEMP/pkg-selfcontained"
+          npm install --prefix "$RUNNER_TEMP/sc" --no-audit --no-fund --ignore-scripts \
+            "$RUNNER_TEMP/pkg-candidate/openclaw-$CANDIDATE_VERSION.tgz"
+          mkdir -p "$RUNNER_TEMP/scpkg/package"
+          cp -a "$RUNNER_TEMP/sc/node_modules/openclaw/." "$RUNNER_TEMP/scpkg/package/"
+          mkdir -p "$RUNNER_TEMP/scpkg/package/node_modules"
+          for entry in "$RUNNER_TEMP"/sc/node_modules/*; do
+            name=$(basename "$entry")
+            if [ "$name" = "openclaw" ]; then continue; fi
+            cp -a "$entry" "$RUNNER_TEMP/scpkg/package/node_modules/"
+          done
+          node - "$RUNNER_TEMP/scpkg/package/package.json" <<'NODE'
+          const fs = require("node:fs");
+          const file = process.argv[2];
+          const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+          pkg.dependencies = {};
+          delete pkg.optionalDependencies;
+          delete pkg.peerDependencies;
+          pkg.bundleDependencies = [];
+          fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+          NODE
+          mkdir -p "$RUNNER_TEMP/pkg-selfcontained"
+          tar -czf "$RUNNER_TEMP/pkg-selfcontained/openclaw-$CANDIDATE_VERSION.tgz" \
+            -C "$RUNNER_TEMP/scpkg" package
+          cp "$RUNNER_TEMP/reviewed-build-id.txt" "$RUNNER_TEMP/pkg-selfcontained/"
+          ls -l "$RUNNER_TEMP/pkg-selfcontained"
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: proof-artifacts
           path: |
-            ${{ runner.temp }}/pkg-candidate/openclaw-*.tgz
-            ${{ runner.temp }}/pkg-candidate/reviewed-build-id.txt
-            ${{ runner.temp }}/pkg-driver/openclaw-*.tgz
-            ${{ runner.temp }}/pkg-driver/reviewed-build-id.txt
+            ${{ runner.temp }}/pkg-selfcontained/openclaw-*.tgz
+            ${{ runner.temp }}/pkg-selfcontained/reviewed-build-id.txt
           if-no-files-found: error
 
   proof:
@@ -121,8 +139,8 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p /tmp/proof-artifacts
-          cp /tmp/proof-download/pkg-candidate/* /tmp/proof-artifacts/
-          cp /tmp/proof-download/pkg-driver/* /tmp/proof-artifacts/
+          cp /tmp/proof-download/*/openclaw-*.tgz /tmp/proof-artifacts/
+          cp /tmp/proof-download/*/reviewed-build-id.txt /tmp/proof-artifacts/
           ls -l /tmp/proof-artifacts
 
       - name: Start the systemd user manager

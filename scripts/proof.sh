@@ -74,8 +74,8 @@ CAND_FIX_MARKERS=$(tar -xzOf "$CAND_TARBALL" --wildcards 'package/dist/update-ma
 note "candidate fix markers in shipped dist: $CAND_FIX_MARKERS"
 CAND_INVENTORY=$(tar -xzOf "$CAND_TARBALL" package/dist/postinstall-inventory.json 2>/dev/null | head -c 1)
 note "candidate dist inventory present: ${CAND_INVENTORY:+yes}"
-tar -xzf "$CAND_TARBALL" -C "$WORK" && mv "$WORK/package" "$WORK/cand-root"
-CAND_VERSION_ACTUAL=$(node -e 'console.log(require(process.argv[1]).version)' "$WORK/cand-root/package.json")
+tar -xzOf "$CAND_TARBALL" package/package.json >"$WORK/candidate-manifest.json"
+CAND_VERSION_ACTUAL=$(node -e 'console.log(require(process.argv[1]).version)' "$WORK/candidate-manifest.json")
 note "candidate package version: $CAND_VERSION_ACTUAL"
 
 say "candidate staged install probe (npm install + shipped entrypoint)"
