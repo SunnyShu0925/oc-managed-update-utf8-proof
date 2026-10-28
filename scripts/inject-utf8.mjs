@@ -16,8 +16,10 @@ function log(line) {
 }
 
 const argv = process.argv.slice(1);
-const inManagedUpdate =
-  process.env.OPENCLAW_UPDATE_RUN_HANDOFF === "1" && argv.includes("update");
+// The updater is the CLI the managed handoff helper spawns directly. Older
+// drivers (for example published 2026.10.8) do not set
+// OPENCLAW_UPDATE_RUN_HANDOFF, so the parent process identity is the guard.
+const inManagedUpdate = argv.includes("update");
 let parentCmdline = "";
 if (inManagedUpdate) {
   try {
