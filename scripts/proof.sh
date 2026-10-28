@@ -147,7 +147,9 @@ run_managed_update() {
   fi
   note "$label handoff dir: ${handoff:-none}"
   if [ -n "$handoff" ] && [ -f "$handoff/handoff.log" ]; then
-    echo "--- $label handoff.log invalid-UTF-8 lines: $(grep -c 'invalid UTF-8' "$handoff/handoff.log" 2>/dev/null || echo 0)"
+    WARN_LINES=$(grep -c 'invalid UTF-8' "$handoff/handoff.log" 2>/dev/null | head -1)
+    WARN_LINES=${WARN_LINES:-0}
+    echo "--- $label handoff.log invalid-UTF-8 lines: $WARN_LINES"
     grep 'invalid UTF-8' "$handoff/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
     echo "--- $label handoff.log command/helper lines ---"
     grep -E 'starting managed update command|update command pid|update command exited|helper completed' "$handoff/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
@@ -222,7 +224,8 @@ section "verdict"
 NEWEST_HANDOFF=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
 B_WARN_TOTAL=0
 if [ -n "$NEWEST_HANDOFF" ]; then
-  B_WARN_TOTAL=$(grep -c 'invalid UTF-8' "$NEWEST_HANDOFF/handoff.log" 2>/dev/null || echo 0)
+  B_WARN_TOTAL=$(grep -c 'invalid UTF-8' "$NEWEST_HANDOFF/handoff.log" 2>/dev/null | head -1)
+  B_WARN_TOTAL=${B_WARN_TOTAL:-0}
 fi
 note "verdict inputs: runAExit=$A_RC runAVerify=$A_OK runBExit=$B_RC runBVerify=$B_OK latestHandoffWarnings=$B_WARN_TOTAL"
 echo "all handoff warning lines across runs:"
