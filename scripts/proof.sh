@@ -129,7 +129,7 @@ console.log(`cron before: ${list.length} job(s) ${list.map((job) => job.name ?? 
 # automation-triggered update. The preload only arms inside the managed handoff
 # updater, so every other process in the tree is untouched.
 run_scheduled_update() {
-  local label="$1" target="$2"
+  local label="$1" target="$2" trigger="${3:-$OPENCLAW}"
   local out="/tmp/update-$label.json"
   local script="/tmp/run-update-$label.sh"
   cat >"$script" <<SH
@@ -142,7 +142,7 @@ SH
   rm -f "$out" "$out.err" "$out.rc"
   local job_id=""
   for _ in $(seq 1 30); do
-    job_id=$("$OPENCLAW" cron add --name "proof-update-$label" --cron "0 0 1 1 *" \
+    job_id=$("$trigger" cron add --name "proof-update-$label" --cron "0 0 1 1 *" \
       --command "bash $script" --json 2>/tmp/cron-add-$label.err |
       node -e 'let raw="";process.stdin.on("data",(d)=>raw+=d).on("end",()=>{try{const j=JSON.parse(raw);console.log(j.id??j.job?.id??"")}catch{console.log("")}})')
     [ -n "$job_id" ] && break
@@ -156,7 +156,7 @@ SH
   local before_dir before_report
   before_dir=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
   before_report=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
-  "$OPENCLAW" cron run "$job_id" --json 2>&1 | tail -3
+  "$trigger" cron run "$job_id" --json 2>&1 | tail -3
   local handoff=""
   for _ in $(seq 1 100); do
     sleep 5
@@ -195,21 +195,30 @@ note "runA settings sha256: $(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d
 "$OPENCLAW" cron list --json >/tmp/cron-after-a.json 2>/dev/null || true
 
 say "install the reviewed driver build ($CAND)"
+# Keep the already-running Gateway so the update driver on disk can be the reviewed
+# build without restarting production code mid-proof. The saved published CLI is
+# used only for Gateway RPC while the reviewed build performs the update.
+npm install -g --prefix /tmp/published-cli "openclaw@$BASE_TARGET" --no-audit --no-fund 2>&1 | tail -2
+PUBLISHED_CLI=/tmp/published-cli/bin/openclaw
+note "saved published CLI: $("$PUBLISHED_CLI" --version 2>&1)"
 npm install -g "$WORK/cand.tgz" --no-audit --no-fund 2>&1 | tail -3
 note "reviewed driver installed: $("$OPENCLAW" --version 2>&1)"
-systemctl --user restart openclaw-gateway
-sleep 3
-wait_gateway_running && note "gateway restarted on the reviewed driver" || note "gateway restart: NOT running"
-wait_gateway_rpc && note "gateway RPC on the reviewed driver: ready" || note "gateway RPC on the reviewed driver: NOT ready"
-note "reviewed driver reported version: $("$OPENCLAW" --version 2>&1)"
+if systemctl --user is-active openclaw-gateway >/dev/null 2>&1; then
+  note "gateway service still running while the reviewed CLI is installed"
+else
+  note "gateway service stopped after the driver swap"
+  journalctl --user -u openclaw-gateway --no-pager -n 40 2>&1 | tail -40 | tee -a "$SUMMARY"
+  exit 1
+fi
 
 say "RUN B: reviewed driver (with the fix) -> published $FIX_TARGET"
-run_scheduled_update "runB" "$FIX_TARGET"
+run_scheduled_update "runB" "$FIX_TARGET" "$PUBLISHED_CLI"
 B_INSTALLED=$("$OPENCLAW" --version 2>&1)
 note "runB installed: $B_INSTALLED"
 
 say "verify operator data survived"
-"$OPENCLAW" cron list --json >/tmp/cron-after.json 2>/dev/null || true
+VERIFY_CLI="${PUBLISHED_CLI:-$OPENCLAW}"
+"$VERIFY_CLI" cron list --json >/tmp/cron-after.json 2>/dev/null || true
 node -e '
 const jobs = require("/tmp/cron-after.json");
 const list = Array.isArray(jobs) ? jobs : (jobs.jobs ?? []);
@@ -224,7 +233,7 @@ console.log(`config gateway.port=${config.gateway?.port} logging.level=${config.
 ' | tee -a "$SUMMARY"
 note "final settings sha256: $(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d' ' -f1)"
 note "workspace marker: $(cat "$HOME/.openclaw/workspace/PROOF_MARKER.txt" 2>/dev/null)"
-"$OPENCLAW" gateway status --json >/tmp/gateway-status-after.json 2>/dev/null || true
+"$VERIFY_CLI" gateway status --json >/tmp/gateway-status-after.json 2>/dev/null || true
 node -e '
 const s = require("/tmp/gateway-status-after.json");
 console.log(`service after=${s?.service?.runtime?.status} version=${s?.service?.runtime?.version ?? s?.rpc?.version ?? "n/a"} pid=${s?.service?.runtime?.pid ?? "n/a"}`);
