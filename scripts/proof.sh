@@ -220,7 +220,7 @@ if [ "$DIRECT_UPDATE" = "1" ]; then
   cat >"$SCRIPT" <<SH
 #!/bin/bash
 $REGISTRY_ENV
-"$OPENCLAW" update --yes --json --tag "$TARGET" --timeout 1200 >"$OUT" 2>"$OUT.err"
+"$OPENCLAW" update --yes --json --no-restart --tag "$TARGET" --timeout 1200 >"$OUT" 2>"$OUT.err"
 echo \$? >"$OUT.rc"
 SH
   chmod +x "$SCRIPT"
@@ -230,8 +230,9 @@ SH
   tail -c 2500 "$OUT" | tee -a "$SUMMARY"
   echo
   tail -5 "$OUT.err" | tee -a "$SUMMARY"
-  "$OPENCLAW" gateway start --json 2>&1 | tail -3 | tee -a "$SUMMARY" || true
+  "$OPENCLAW" gateway restart --json 2>&1 | tail -3 | tee -a "$SUMMARY" || true
   sleep 5
+  wait_gateway_running && note "gateway service: running after restart" || note "gateway service: NOT running after restart"
 else
   cat >"$SCRIPT" <<SH
 #!/bin/bash
