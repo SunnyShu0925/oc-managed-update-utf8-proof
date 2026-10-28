@@ -16,7 +16,7 @@ on:
         required: true
         default: "2026.10.10-beta.3"
       fix_target_version:
-        description: Published target for the reviewed-driver scenario
+        description: Reviewed next build used as the second target
         required: true
         default: "2026.10.10"
 
@@ -24,7 +24,57 @@ permissions:
   contents: read
 
 jobs:
+  build-candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout reviewed PR head
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: fix/update-managed-service-handoff-lossy-utf8
+          fetch-depth: 1
+
+      - name: Setup Node 24.22.1
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+
+      - name: Install workspace dependencies
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+          pnpm install --frozen-lockfile
+
+      - name: Build the reviewed next release artifact
+        run: |
+          node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.version=process.env.TARGET_VERSION;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
+          node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/pkg" --output-name "openclaw-$TARGET_VERSION.tgz"
+          git checkout -- package.json
+        env:
+          TARGET_VERSION: ${{ inputs.fix_target_version }}
+
+      - name: Pack the reviewed driver build
+        run: |
+          node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.version=process.env.DRIVER_VERSION;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
+          node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog --skip-build \
+            --output-dir "$RUNNER_TEMP/pkg" --output-name "openclaw-$DRIVER_VERSION.tgz"
+          git checkout -- package.json
+          ls -l "$RUNNER_TEMP/pkg"
+        env:
+          DRIVER_VERSION: ${{ inputs.candidate_version }}
+
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-artifacts
+          path: ${{ runner.temp }}/pkg/openclaw-*.tgz
+          if-no-files-found: error
+
   proof:
+    needs: build-candidate
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +94,12 @@ jobs:
         with:
           node-version: 24.22.1
 
+      - name: Download reviewed candidate artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-artifacts
+          path: /tmp/candidate-artifacts
+
       - name: Start the systemd user manager
         run: |
           sudo loginctl enable-linger "$USER"
@@ -53,8 +109,6 @@ jobs:
           echo "npm_config_prefix=$HOME/.npm-global" >> "$GITHUB_ENV"
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
           sleep 2
-          # Restart once the bus socket exists so the manager registers on it
-          # (managed-service inspection needs org.freedesktop.systemd1).
           sudo systemctl restart "user@$(id -u).service"
           sleep 3
           systemctl --user is-system-running || true
@@ -64,13 +118,12 @@ jobs:
       - name: Report reviewed build identity
         run: |
           echo "proof harness head: $(git rev-parse HEAD)"
-          curl -fsSL "$GITHUB_API_URL/repos/SunnyShu0925/openclaw/commits/fix/update-managed-service-handoff-lossy-utf8" \
-            | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const c=JSON.parse(s);console.log(`reviewed PR head: ${c.sha} ${c.commit?.message?.split("\n")[0]}`)})'
 
       - name: Run the managed update proof (${{ matrix.scenario }})
         env:
           SCENARIO: ${{ matrix.scenario }}
           GATEWAY_PORT: ${{ matrix.port }}
+          TARBALL_DIR: /tmp/candidate-artifacts
           STABLE_VERSION: ${{ inputs.stable_version }}
           CAND_VERSION: ${{ inputs.candidate_version }}
           BASE_TARGET_VERSION: ${{ inputs.base_target_version }}
@@ -95,5 +148,6 @@ jobs:
             /tmp/proof-summary.txt
             /tmp/handoff.log
             /tmp/inject-gateway.log
+            /tmp/registry.log
             /home/runner/.openclaw/update-reports/*.md
           if-no-files-found: warn

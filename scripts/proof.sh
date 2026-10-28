@@ -56,8 +56,13 @@ note "scenario=$SCENARIO driver=$DRIVER_LABEL target=$TARGET"
 
 say "install the driver: $DRIVER_LABEL"
 if [ "$SCENARIO" = "fix" ]; then
-  curl -fsSL -o "$WORK/cand.tgz" "$ASSET_BASE/openclaw-$CAND.tgz"
-  curl -fsSL -o "$WORK/target.tgz" "$ASSET_BASE/openclaw-$TARGET.tgz"
+  if [ -n "${TARBALL_DIR:-}" ]; then
+    cp "$TARBALL_DIR/openclaw-$CAND.tgz" "$WORK/cand.tgz"
+    cp "$TARBALL_DIR/openclaw-$TARGET.tgz" "$WORK/target.tgz"
+  else
+    curl -fsSL -o "$WORK/cand.tgz" "$ASSET_BASE/openclaw-$CAND.tgz"
+    curl -fsSL -o "$WORK/target.tgz" "$ASSET_BASE/openclaw-$TARGET.tgz"
+  fi
   sha256sum "$WORK/cand.tgz" "$WORK/target.tgz" | tee -a "$SUMMARY"
   FIX_MARKERS=$(tar -xzOf "$WORK/cand.tgz" --wildcards 'package/dist/update-managed-service-handoff-current-*.mjs' |
     grep -c "retained a lossy copy")
