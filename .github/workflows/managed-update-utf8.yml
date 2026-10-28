@@ -8,25 +8,21 @@ on:
         required: true
         default: "2026.10.8"
       candidate_version:
-        description: Reviewed driver build version
+        description: Published target version carrying the reviewed candidate
+        required: true
+        default: "2026.10.10-beta.4"
+      driver_version:
+        description: Earlier version used to build the reviewed driver package
         required: true
         default: "2026.10.9"
-      base_target_version:
-        description: Published target for the baseline scenario
-        required: true
-        default: "2026.10.10-beta.3"
-      fix_target_version:
-        description: Reviewed next build used as the second target
-        required: true
-        default: "2026.10.10"
 
 permissions:
   contents: read
 
 jobs:
-  build-candidate:
+  build-artifacts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout reviewed PR head
         uses: actions/checkout@v4
@@ -47,41 +43,52 @@ jobs:
           pnpm --version
           pnpm install --frozen-lockfile
 
-      - name: Build the reviewed next release artifact
+      - name: Build the reviewed candidate package
         run: |
           node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.version=process.env.TARGET_VERSION;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
           node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog \
-            --output-dir "$RUNNER_TEMP/pkg" --output-name "openclaw-$TARGET_VERSION.tgz"
+            --output-dir "$RUNNER_TEMP/pkg-candidate" --output-name "openclaw-$TARGET_VERSION.tgz"
           git checkout -- package.json
         env:
-          TARGET_VERSION: ${{ inputs.fix_target_version }}
+          TARGET_VERSION: ${{ inputs.candidate_version }}
 
-      - name: Pack the reviewed driver build
+      - name: Build the reviewed driver package
         run: |
           node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.version=process.env.DRIVER_VERSION;fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
-          node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog --skip-build \
-            --output-dir "$RUNNER_TEMP/pkg" --output-name "openclaw-$DRIVER_VERSION.tgz"
+          node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/pkg-driver" --output-name "openclaw-$DRIVER_VERSION.tgz"
           git checkout -- package.json
-          ls -l "$RUNNER_TEMP/pkg"
+          ls -l "$RUNNER_TEMP/pkg-candidate" "$RUNNER_TEMP/pkg-driver"
         env:
-          DRIVER_VERSION: ${{ inputs.candidate_version }}
+          DRIVER_VERSION: ${{ inputs.driver_version }}
 
-      - name: Upload candidate artifacts
+      - name: Record the reviewed build identity
+        run: |
+          git rev-parse --short=7 HEAD > "$RUNNER_TEMP/reviewed-build-id.txt"
+          cat "$RUNNER_TEMP/reviewed-build-id.txt"
+          cp "$RUNNER_TEMP/reviewed-build-id.txt" "$RUNNER_TEMP/pkg-candidate/"
+          cp "$RUNNER_TEMP/reviewed-build-id.txt" "$RUNNER_TEMP/pkg-driver/"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-artifacts
-          path: ${{ runner.temp }}/pkg/openclaw-*.tgz
+          name: proof-artifacts
+          path: |
+            ${{ runner.temp }}/pkg-candidate/openclaw-*.tgz
+            ${{ runner.temp }}/pkg-candidate/reviewed-build-id.txt
+            ${{ runner.temp }}/pkg-driver/openclaw-*.tgz
+            ${{ runner.temp }}/pkg-driver/reviewed-build-id.txt
           if-no-files-found: error
 
   proof:
-    needs: build-candidate
+    needs: build-artifacts
     strategy:
       fail-fast: false
       matrix:
         include:
-          - scenario: baseline
+          - scenario: stable-driver
             port: 18833
-          - scenario: fix
+          - scenario: reviewed-driver
             port: 18834
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -94,11 +101,11 @@ jobs:
         with:
           node-version: 24.22.1
 
-      - name: Download reviewed candidate artifacts
+      - name: Download proof artifacts
         uses: actions/download-artifact@v4
         with:
-          name: candidate-artifacts
-          path: /tmp/candidate-artifacts
+          name: proof-artifacts
+          path: /tmp/proof-artifacts
 
       - name: Start the systemd user manager
         run: |
@@ -118,16 +125,16 @@ jobs:
       - name: Report reviewed build identity
         run: |
           echo "proof harness head: $(git rev-parse HEAD)"
+          cat /tmp/proof-artifacts/reviewed-build-id.txt
 
       - name: Run the managed update proof (${{ matrix.scenario }})
         env:
           SCENARIO: ${{ matrix.scenario }}
           GATEWAY_PORT: ${{ matrix.port }}
-          TARBALL_DIR: /tmp/candidate-artifacts
+          ARTIFACT_DIR: /tmp/proof-artifacts
           STABLE_VERSION: ${{ inputs.stable_version }}
           CAND_VERSION: ${{ inputs.candidate_version }}
-          BASE_TARGET_VERSION: ${{ inputs.base_target_version }}
-          FIX_TARGET_VERSION: ${{ inputs.fix_target_version }}
+          DRIVER_VERSION: ${{ inputs.driver_version }}
         run: bash "$GITHUB_WORKSPACE/scripts/proof.sh"
 
       - name: Upload proof logs (${{ matrix.scenario }})
@@ -149,5 +156,6 @@ jobs:
             /tmp/handoff.log
             /tmp/inject-gateway.log
             /tmp/registry.log
+            /tmp/registry.out
             /home/runner/.openclaw/update-reports/*.md
           if-no-files-found: warn

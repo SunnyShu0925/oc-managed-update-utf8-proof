@@ -2,39 +2,47 @@
 # Managed-service update proof for PR #186033 (strict UTF-8 decoding of the
 # managed update handoff output) on a GitHub-hosted Ubuntu VM with real systemd.
 #
-# One scenario per run (SCENARIO env):
-#   baseline: published 2026.10.8 driver (no fix)  -> published 2026.10.10-beta.3
-#   fix:      reviewed build driver (has the fix)  -> published 2026.10.10-beta.4
+# Two scenarios, one per job:
+#   stable-driver:   published 2026.10.8 -> reviewed candidate package (served by a
+#                    loopback registry)   expect: completed upgrade, 0 warnings
+#   reviewed-driver: reviewed driver build -> published 2026.10.10-beta.4
+#                    expect: completed upgrade, 1 warning from the reviewed decoder
 #
 # The update is started from a cron command job, so the updater runs inside the
-# Gateway process tree exactly like a scheduled update and uses the shipped
-# managed-service handoff. A preload in the Gateway environment adds one raw 0xFF
-# byte to the handoff updater's stdout, so the handoff decoder is the exercise.
+# Gateway process tree and takes the shipped managed-service handoff. A preload
+# in the Gateway environment appends one raw 0xFF byte inside the updater's JSON
+# stdout, so the handoff decoder is the code under test.
 set -uo pipefail
 
-SCENARIO="${SCENARIO:-fix}"
+SCENARIO="${SCENARIO:-stable-driver}"
 STABLE="${STABLE_VERSION:-2026.10.8}"
-BASE_TARGET="${BASE_TARGET_VERSION:-2026.10.10-beta.3}"
-FIX_TARGET="${FIX_TARGET_VERSION:-2026.10.10}"
-CAND="${CAND_VERSION:-2026.10.9}"
-ASSET_BASE="${ASSET_BASE:-https://github.com/SunnyShu0925/oc-managed-update-utf8-proof/releases/download/v1}"
+CAND="${CAND_VERSION:-2026.10.10-beta.4}"
+DRIVER="${DRIVER_VERSION:-2026.10.9}"
 PORT="${GATEWAY_PORT:-18833}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/proof-artifacts}"
+EXPECT_BUILD_ID="$(head -1 "$ARTIFACT_DIR/reviewed-build-id.txt" 2>/dev/null | tr -d '[:space:]')"
 TOKEN=proof-token-186033
 WORK=/tmp/proof186033
 SUMMARY=/tmp/proof-summary.txt
 INJECT_LOG=/tmp/inject-gateway.log
-mkdir -p "$WORK"
+REGISTRY_PORT=48771
+mkdir -p "$WORK" "$HOME/.openclaw/workspace"
 : >"$SUMMARY"
 : >"$INJECT_LOG"
 
-if [ "$SCENARIO" = "baseline" ]; then
-  TARGET="$BASE_TARGET"
-  DRIVER_LABEL="published $STABLE (no fix)"
+TARGET="$CAND"
+if [ "$SCENARIO" = "stable-driver" ]; then
+  DRIVER_LABEL="published driver $STABLE (no fix)"
+  DRIVER_MODE=npm
+  USE_REGISTRY=1
   EXPECT_WARN=0
+  EXPECT_TARGET_BUILD="$EXPECT_BUILD_ID"
 else
-  TARGET="$FIX_TARGET"
-  DRIVER_LABEL="reviewed build $CAND (has the fix)"
+  DRIVER_LABEL="reviewed driver $DRIVER (has the fix)"
+  DRIVER_MODE=tarball
+  USE_REGISTRY=0
   EXPECT_WARN=1
+  EXPECT_TARGET_BUILD=""
 fi
 
 say() { echo; echo "=== $* ==="; }
@@ -47,57 +55,72 @@ say "environment ($SCENARIO)"
   node --version
   npm --version
   echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
-  echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
   systemctl --user is-system-running || true
-  busctl --user list | grep -E "org.freedesktop.systemd1" || echo "systemd1 not on the user bus"
 } 2>&1 | tee -a "$SUMMARY"
 note "proof harness commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 note "scenario=$SCENARIO driver=$DRIVER_LABEL target=$TARGET"
+note "reviewed build id: ${EXPECT_BUILD_ID:-unknown}"
+ls -l "$ARTIFACT_DIR" | tee -a "$SUMMARY"
 
-say "install the driver: $DRIVER_LABEL"
-if [ "$SCENARIO" = "fix" ]; then
-  if [ -n "${TARBALL_DIR:-}" ]; then
-    cp "$TARBALL_DIR/openclaw-$CAND.tgz" "$WORK/cand.tgz"
-    cp "$TARBALL_DIR/openclaw-$TARGET.tgz" "$WORK/target.tgz"
-  else
-    curl -fsSL -o "$WORK/cand.tgz" "$ASSET_BASE/openclaw-$CAND.tgz"
-    curl -fsSL -o "$WORK/target.tgz" "$ASSET_BASE/openclaw-$TARGET.tgz"
-  fi
-  sha256sum "$WORK/cand.tgz" "$WORK/target.tgz" | tee -a "$SUMMARY"
-  FIX_MARKERS=$(tar -xzOf "$WORK/cand.tgz" --wildcards 'package/dist/update-managed-service-handoff-current-*.mjs' |
-    grep -c "retained a lossy copy")
-  INV=$(tar -xzOf "$WORK/cand.tgz" package/dist/postinstall-inventory.json 2>/dev/null | head -c 1)
-  note "reviewed build fix markers in shipped dist: $FIX_MARKERS"
-  note "reviewed build dist inventory present: ${INV:+yes}"
-  tar -xzOf "$WORK/target.tgz" package/package.json >"$WORK/target-manifest.json"
-  PROOF_REGISTRY_PORT=48771 PROOF_TARBALL="$WORK/target.tgz" \
-  PROOF_CANDIDATE_VERSION="$TARGET" PROOF_BASE_VERSION="$STABLE" \
-  PROOF_CANDIDATE_MANIFEST="$WORK/target-manifest.json" PROOF_REGISTRY_LOG=/tmp/registry.log \
+CAND_TARBALL="$ARTIFACT_DIR/openclaw-$CAND.tgz"
+DRIVER_TARBALL="$ARTIFACT_DIR/openclaw-$DRIVER.tgz"
+
+say "inspect the reviewed candidate package"
+sha256sum "$CAND_TARBALL" | tee -a "$SUMMARY"
+CAND_FIX_MARKERS=$(tar -xzOf "$CAND_TARBALL" --wildcards 'package/dist/update-managed-service-handoff-current-*.mjs' |
+  grep -c "retained a lossy copy")
+note "candidate fix markers in shipped dist: $CAND_FIX_MARKERS"
+CAND_INVENTORY=$(tar -xzOf "$CAND_TARBALL" package/dist/postinstall-inventory.json 2>/dev/null | head -c 1)
+note "candidate dist inventory present: ${CAND_INVENTORY:+yes}"
+tar -xzf "$CAND_TARBALL" -C "$WORK" && mv "$WORK/package" "$WORK/cand-root"
+CAND_VERSION_ACTUAL=$(node -e 'console.log(require(process.argv[1]).version)' "$WORK/cand-root/package.json")
+note "candidate package version: $CAND_VERSION_ACTUAL"
+
+say "candidate executor probe (shipped entrypoint, closed stdin)"
+( cd "$WORK/cand-root" && node dist/cli/daemon-cli.js gateway install --update-executor check --json </dev/null ) \
+  >"$WORK/cand-probe.json" 2>"$WORK/cand-probe.err"
+note "candidate executor probe rc=$?"
+head -c 400 "$WORK/cand-probe.json" | tee -a "$SUMMARY"
+echo
+
+if [ "$USE_REGISTRY" = "1" ]; then
+  say "start the loopback registry that serves the reviewed candidate"
+  tar -xzOf "$CAND_TARBALL" package/package.json >"$WORK/candidate-manifest.json"
+  PROOF_REGISTRY_PORT="$REGISTRY_PORT" PROOF_TARBALL="$CAND_TARBALL" \
+  PROOF_CANDIDATE_VERSION="$CAND" PROOF_BASE_VERSION="$STABLE" \
+  PROOF_CANDIDATE_MANIFEST="$WORK/candidate-manifest.json" PROOF_REGISTRY_LOG=/tmp/registry.log \
     node scripts/registry-proxy.mjs >/tmp/registry.out 2>&1 &
+  REGISTRY_PID=$!
   for _ in $(seq 1 60); do
-    curl -sf -o /dev/null "http://127.0.0.1:48771/openclaw" && break
+    curl -sf -o /dev/null "http://127.0.0.1:$REGISTRY_PORT/openclaw" && break
     sleep 1
   done
-  curl -s "http://127.0.0.1:48771/openclaw" | node -e '
+  curl -s "http://127.0.0.1:$REGISTRY_PORT/openclaw" | node -e '
 let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk)).on("end", () => {
   const doc = JSON.parse(raw);
   const version = doc["dist-tags"].latest;
-  console.log(`registry latest=${version} schemaVersions=${JSON.stringify(doc.versions[version].openclaw?.schemaVersions)}`);
+  console.log(`registry latest=${version} tarball=${doc.versions[version].dist.tarball}`);
 });
 ' | tee -a "$SUMMARY"
-  npm install -g "$WORK/cand.tgz" --no-audit --no-fund 2>&1 | tail -3
+  tail -3 /tmp/registry.log | tee -a "$SUMMARY"
+  note "registry pid=$REGISTRY_PID"
+fi
+
+say "install the driver: $DRIVER_LABEL"
+if [ "$DRIVER_MODE" = "npm" ]; then
+  npm install -g "openclaw@$STABLE" --no-audit --no-fund 2>&1 | tail -3 | tee -a "$SUMMARY"
 else
-  npm install -g "openclaw@$STABLE" --no-audit --no-fund 2>&1 | tail -3
+  sha256sum "$DRIVER_TARBALL" | tee -a "$SUMMARY"
+  DRIVER_FIX_MARKERS=$(tar -xzOf "$DRIVER_TARBALL" --wildcards 'package/dist/update-managed-service-handoff-current-*.mjs' |
+    grep -c "retained a lossy copy")
+  note "driver fix markers in shipped dist: $DRIVER_FIX_MARKERS"
+  npm install -g "$DRIVER_TARBALL" --no-audit --no-fund 2>&1 | tail -3 | tee -a "$SUMMARY"
 fi
 OPENCLAW="$HOME/.npm-global/bin/openclaw"
 note "installed driver: $("$OPENCLAW" --version 2>&1)"
-DRIVER_MARKERS=$(grep -c "retained a lossy copy" \
-  "$HOME"/.npm-global/lib/node_modules/openclaw/dist/update-managed-service-handoff-current-*.mjs 2>/dev/null | head -1)
-note "installed driver fix markers in shipped dist: ${DRIVER_MARKERS:-0}"
 
 say "seed operator state (settings, workspace data)"
-mkdir -p "$HOME/.openclaw/workspace"
 cat >"$HOME/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback", "port": $PORT, "auth": { "mode": "token", "token": "$TOKEN" } },
@@ -111,7 +134,7 @@ SETTINGS_SHA=$(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d' ' -f1)
 note "settings sha256: $SETTINGS_SHA"
 
 say "install and start the managed gateway service"
-"$OPENCLAW" gateway install --port "$PORT" --token "$TOKEN" --json 2>&1 | tail -4
+"$OPENCLAW" gateway install --port "$PORT" --token "$TOKEN" --json 2>&1 | tail -4 | tee -a "$SUMMARY"
 wait_gateway_running() {
   for _ in $(seq 1 90); do
     "$OPENCLAW" gateway status --json >/tmp/gateway-status.json 2>/dev/null || true
@@ -155,22 +178,24 @@ fi
 note "gateway restarted with the preload"
 wait_gateway_rpc && note "gateway RPC after restart: ready" || note "gateway RPC after restart: NOT ready"
 
-say "seed a cron data marker through the shipped CLI"
-"$OPENCLAW" cron add --name proof-data --every 1d --agent main --message "proof turn" --json 2>&1 | tail -3
+say "seed operator data through the shipped CLI"
+"$OPENCLAW" cron add --name proof-data --cron "0 0 1 1 *" --command "echo proof-data" --json 2>&1 | tail -3 | tee -a "$SUMMARY"
 "$OPENCLAW" cron list --json >/tmp/cron-before.json 2>/dev/null || true
 node -e '
 const jobs = require("/tmp/cron-before.json");
 const list = Array.isArray(jobs) ? jobs : (jobs.jobs ?? []);
-console.log(`cron before: ${list.length} job(s) ${list.map((job) => job.name ?? job.displayName ?? job.id).join(",")}`);
+const names = list.map((job) => job.name ?? job.displayName ?? job.id);
+console.log(`cron before: ${list.length} job(s) ${names.join(",")}`);
+console.log(`proof-data seeded=${names.includes("proof-data") ? "yes" : "no"}`);
 ' | tee -a "$SUMMARY"
 
-say "RUN: $DRIVER_LABEL -> published $TARGET"
+say "RUN: $DRIVER_LABEL -> $TARGET"
 OUT=/tmp/update.json
 SCRIPT=/tmp/run-update.sh
 REGISTRY_ENV=""
-if [ "$SCENARIO" = "fix" ]; then
-  REGISTRY_ENV='export NPM_CONFIG_REGISTRY="http://127.0.0.1:48771"
-export OPENCLAW_UPDATE_PACKAGE_SPEC=openclaw'
+if [ "$USE_REGISTRY" = "1" ]; then
+  REGISTRY_ENV="export NPM_CONFIG_REGISTRY=\"http://127.0.0.1:$REGISTRY_PORT\"
+export OPENCLAW_UPDATE_PACKAGE_SPEC=openclaw"
 fi
 cat >"$SCRIPT" <<SH
 #!/bin/bash
@@ -195,7 +220,7 @@ if [ -z "$JOB_ID" ]; then
 fi
 BEFORE_DIR=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
 BEFORE_REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
-"$OPENCLAW" cron run "$JOB_ID" --json 2>&1 | tail -3
+"$OPENCLAW" cron run "$JOB_ID" --json 2>&1 | tail -3 | tee -a "$SUMMARY"
 HANDOFF=""
 for _ in $(seq 1 100); do
   sleep 5
@@ -223,7 +248,7 @@ echo "--- update rc: $(cat "$OUT.rc" 2>/dev/null || echo missing) ---"
 REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
 if [ -n "$REPORT" ] && [ "$REPORT" != "$BEFORE_REPORT" ]; then
   echo "--- update report ---"
-  head -12 "$REPORT" | tee -a "$SUMMARY"
+  head -20 "$REPORT" | tee -a "$SUMMARY"
 fi
 wait_gateway_running && note "gateway service: running" || note "gateway service: NOT running"
 
@@ -236,14 +261,13 @@ const jobs = require("/tmp/cron-after.json");
 const list = Array.isArray(jobs) ? jobs : (jobs.jobs ?? []);
 const names = list.map((job) => job.name ?? job.displayName ?? job.id);
 console.log(`cron after: ${list.length} job(s) ${names.join(",")}`);
-console.log(`proof-data=${names.includes("proof-data") ? "present" : "MISSING"}`);
+console.log(`proof-data survived=${names.includes("proof-data") ? "yes" : "no"}`);
 ' | tee -a "$SUMMARY"
 node -e '
 const fs = require("node:fs");
 const config = JSON.parse(fs.readFileSync(process.env.HOME + "/.openclaw/openclaw.json", "utf8"));
 console.log(`config gateway.port=${config.gateway?.port} logging.level=${config.logging?.level} workspace=${config.agents?.defaults?.workspace}`);
 ' | tee -a "$SUMMARY"
-note "final settings sha256: $(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d' ' -f1)"
 note "workspace marker: $(cat "$HOME/.openclaw/workspace/PROOF_MARKER.txt" 2>/dev/null)"
 "$OPENCLAW" gateway status --json >/tmp/gateway-status-after.json 2>/dev/null || true
 node -e '
@@ -254,13 +278,20 @@ console.log(`service after=${s?.service?.runtime?.status} version=${s?.service?.
 say "verdict ($SCENARIO)"
 TARGET_OK=no
 case "$INSTALLED" in *"$TARGET"*) TARGET_OK=yes ;; esac
+BUILD_OK=n/a
+if [ -n "$EXPECT_TARGET_BUILD" ]; then
+  BUILD_OK=no
+  case "$INSTALLED" in *"($EXPECT_TARGET_BUILD)"*) BUILD_OK=yes ;; esac
+fi
 SETTINGS_OK=no
 [ "$(sha256sum "$HOME/.openclaw/openclaw.json" | cut -d' ' -f1)" = "$SETTINGS_SHA" ] && SETTINGS_OK=yes
+DATA_OK=no
+[ "$(cat "$HOME/.openclaw/workspace/PROOF_MARKER.txt" 2>/dev/null)" = "proof-data-marker-186033" ] && DATA_OK=yes
 WARN_OK=no
 if [ "$EXPECT_WARN" = "1" ] && [ "${WARN_LINES:-0}" -ge 1 ]; then WARN_OK=yes; fi
 if [ "$EXPECT_WARN" = "0" ] && [ "${WARN_LINES:-0}" -eq 0 ]; then WARN_OK=yes; fi
-note "verdict inputs: targetInstalled=$TARGET_OK settingsIntact=$SETTINGS_OK warnings=$WARN_LINES expectWarning=$EXPECT_WARN"
-if [ "$TARGET_OK" = yes ] && [ "$SETTINGS_OK" = yes ] && [ "$WARN_OK" = yes ]; then
+note "verdict inputs: targetInstalled=$TARGET_OK targetBuildMatch=$BUILD_OK settingsIntact=$SETTINGS_OK dataIntact=$DATA_OK warnings=$WARN_LINES expectWarning=$EXPECT_WARN"
+if [ "$TARGET_OK" = yes ] && [ "$BUILD_OK" != no ] && [ "$SETTINGS_OK" = yes ] && [ "$DATA_OK" = yes ] && [ "$WARN_OK" = yes ]; then
   note "VERDICT=PASS"
 else
   note "VERDICT=FAIL"
