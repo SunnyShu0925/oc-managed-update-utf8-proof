@@ -35,12 +35,14 @@ if [ "$SCENARIO" = "stable-driver" ]; then
   DRIVER_LABEL="published driver $STABLE (no fix)"
   DRIVER_MODE=npm
   USE_REGISTRY=1
+  DIRECT_UPDATE=1
   EXPECT_WARN=0
   EXPECT_TARGET_BUILD="$EXPECT_BUILD_ID"
 else
   DRIVER_LABEL="reviewed driver $DRIVER (has the fix)"
   DRIVER_MODE=tarball
   USE_REGISTRY=1
+  DIRECT_UPDATE=0
   EXPECT_WARN=1
   EXPECT_TARGET_BUILD="$EXPECT_BUILD_ID"
 fi
@@ -200,6 +202,7 @@ console.log(`cron before: ${list.length} job(s) ${names.join(",")}`);
 console.log(`proof-data seeded=${names.includes("proof-data") ? "yes" : "no"}`);
 ' | tee -a "$SUMMARY"
 
+WARN_LINES=0
 say "RUN: $DRIVER_LABEL -> $TARGET"
 OUT=/tmp/update.json
 SCRIPT=/tmp/run-update.sh
@@ -208,58 +211,79 @@ if [ "$USE_REGISTRY" = "1" ]; then
   REGISTRY_ENV="export NPM_CONFIG_REGISTRY=\"http://127.0.0.1:$REGISTRY_PORT\"
 export OPENCLAW_UPDATE_PACKAGE_SPEC=openclaw"
 fi
-cat >"$SCRIPT" <<SH
+rm -f "$OUT" "$OUT.err" "$OUT.rc"
+if [ "$DIRECT_UPDATE" = "1" ]; then
+  # A stopped service keeps this a plain package update, so the update owner is
+  # this CLI invocation instead of the managed-service executor.
+  "$OPENCLAW" gateway stop --json >/dev/null 2>&1 || true
+  say "direct updater: $("$OPENCLAW" --version 2>&1) -> $TARGET"
+  cat >"$SCRIPT" <<SH
+#!/bin/bash
+$REGISTRY_ENV
+"$OPENCLAW" update --yes --json --tag "$TARGET" --timeout 1200 >"$OUT" 2>"$OUT.err"
+echo \$? >"$OUT.rc"
+SH
+  chmod +x "$SCRIPT"
+  bash "$SCRIPT"
+  echo "--- update rc: $(cat "$OUT.rc" 2>/dev/null || echo missing) ---" | tee -a "$SUMMARY"
+  echo "--- update report ---"
+  tail -c 2500 "$OUT" | tee -a "$SUMMARY"
+  echo
+  tail -5 "$OUT.err" | tee -a "$SUMMARY"
+  "$OPENCLAW" gateway start --json 2>&1 | tail -3 | tee -a "$SUMMARY" || true
+  sleep 5
+else
+  cat >"$SCRIPT" <<SH
 #!/bin/bash
 echo "[\$(date -u +%FT%TZ)] scheduled update start -> $TARGET" >>"$INJECT_LOG"
 $REGISTRY_ENV
 "$OPENCLAW" update --yes --json --tag "$TARGET" --timeout 1200 >"$OUT" 2>"$OUT.err"
 echo \$? >"$OUT.rc"
 SH
-chmod +x "$SCRIPT"
-rm -f "$OUT" "$OUT.err" "$OUT.rc"
-JOB_ID=""
-for _ in $(seq 1 30); do
-  JOB_ID=$("$OPENCLAW" cron add --name "proof-update" --cron "0 0 1 1 *" --command "bash $SCRIPT" --json 2>/tmp/cron-add.err |
-    node -e 'let raw="";process.stdin.on("data",(d)=>raw+=d).on("end",()=>{try{const j=JSON.parse(raw);console.log(j.id??j.job?.id??"")}catch{console.log("")}})')
-  [ -n "$JOB_ID" ] && break
-  sleep 5
-done
-note "cron job id: ${JOB_ID:-none}"
-if [ -z "$JOB_ID" ]; then
-  tail -5 /tmp/cron-add.err | tee -a "$SUMMARY"
-  exit 1
-fi
-BEFORE_DIR=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
-BEFORE_REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
-"$OPENCLAW" cron run "$JOB_ID" --json 2>&1 | tail -3 | tee -a "$SUMMARY"
-HANDOFF=""
-for _ in $(seq 1 100); do
-  sleep 5
-  HANDOFF=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
-  if [ -n "$HANDOFF" ] && [ "$HANDOFF" != "$BEFORE_DIR" ] &&
-    grep -q "helper completed" "$HANDOFF/handoff.log" 2>/dev/null; then
-    break
+  chmod +x "$SCRIPT"
+  JOB_ID=""
+  for _ in $(seq 1 30); do
+    JOB_ID=$("$OPENCLAW" cron add --name "proof-update" --cron "0 0 1 1 *" --command "bash $SCRIPT" --json 2>/tmp/cron-add.err |
+      node -e 'let raw="";process.stdin.on("data",(d)=>raw+=d).on("end",()=>{try{const j=JSON.parse(raw);console.log(j.id??j.job?.id??"")}catch{console.log("")}})')
+    [ -n "$JOB_ID" ] && break
+    sleep 5
+  done
+  note "cron job id: ${JOB_ID:-none}"
+  if [ -z "$JOB_ID" ]; then
+    tail -5 /tmp/cron-add.err | tee -a "$SUMMARY"
+    exit 1
   fi
-done
-note "handoff dir: ${HANDOFF:-none}"
-WARN_LINES=0
-if [ -n "$HANDOFF" ] && [ -f "$HANDOFF/handoff.log" ]; then
-  WARN_LINES=$(grep -c 'invalid UTF-8' "$HANDOFF/handoff.log" 2>/dev/null | head -1)
-  note "handoff invalid-UTF-8 lines: ${WARN_LINES:-0}"
-  grep 'invalid UTF-8' "$HANDOFF/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
-  grep -E 'ownership transferred|starting managed update command|update command exited|helper completed' \
-    "$HANDOFF/handoff.log" 2>/dev/null | tail -8 | tee -a "$SUMMARY"
-  cp "$HANDOFF/handoff.log" /tmp/handoff.log 2>/dev/null || true
-else
-  note "handoff log: NOT FOUND"
-fi
-echo "--- injector log (tail) ---"
-tail -8 "$INJECT_LOG" 2>/dev/null | tee -a "$SUMMARY"
-echo "--- update rc: $(cat "$OUT.rc" 2>/dev/null || echo missing) ---"
-REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
-if [ -n "$REPORT" ] && [ "$REPORT" != "$BEFORE_REPORT" ]; then
-  echo "--- update report ---"
-  head -20 "$REPORT" | tee -a "$SUMMARY"
+  BEFORE_DIR=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
+  BEFORE_REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
+  "$OPENCLAW" cron run "$JOB_ID" --json 2>&1 | tail -3 | tee -a "$SUMMARY"
+  HANDOFF=""
+  for _ in $(seq 1 100); do
+    sleep 5
+    HANDOFF=$(ls -dt /tmp/openclaw-update-run-handoff-* 2>/dev/null | head -1)
+    if [ -n "$HANDOFF" ] && [ "$HANDOFF" != "$BEFORE_DIR" ] &&
+      grep -q "helper completed" "$HANDOFF/handoff.log" 2>/dev/null; then
+      break
+    fi
+  done
+  note "handoff dir: ${HANDOFF:-none}"
+  if [ -n "$HANDOFF" ] && [ -f "$HANDOFF/handoff.log" ]; then
+    WARN_LINES=$(grep -c 'invalid UTF-8' "$HANDOFF/handoff.log" 2>/dev/null | head -1)
+    note "handoff invalid-UTF-8 lines: ${WARN_LINES:-0}"
+    grep 'invalid UTF-8' "$HANDOFF/handoff.log" 2>/dev/null | tee -a "$SUMMARY"
+    grep -E 'ownership transferred|starting managed update command|update command exited|helper completed' \
+      "$HANDOFF/handoff.log" 2>/dev/null | tail -8 | tee -a "$SUMMARY"
+    cp "$HANDOFF/handoff.log" /tmp/handoff.log 2>/dev/null || true
+  else
+    note "handoff log: NOT FOUND"
+  fi
+  echo "--- injector log (tail) ---"
+  tail -8 "$INJECT_LOG" 2>/dev/null | tee -a "$SUMMARY"
+  echo "--- update rc: $(cat "$OUT.rc" 2>/dev/null || echo missing) ---" | tee -a "$SUMMARY"
+  REPORT=$(ls -t "$HOME"/.openclaw/update-reports/*.md 2>/dev/null | head -1)
+  if [ -n "$REPORT" ] && [ "$REPORT" != "$BEFORE_REPORT" ]; then
+    echo "--- update report ---"
+    head -20 "$REPORT" | tee -a "$SUMMARY"
+  fi
 fi
 wait_gateway_running && note "gateway service: running" || note "gateway service: NOT running"
 

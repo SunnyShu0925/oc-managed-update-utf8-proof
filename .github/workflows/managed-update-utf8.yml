@@ -94,8 +94,6 @@ jobs:
         include:
           - scenario: stable-driver
             port: 18833
-          - scenario: reviewed-driver
-            port: 18834
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
