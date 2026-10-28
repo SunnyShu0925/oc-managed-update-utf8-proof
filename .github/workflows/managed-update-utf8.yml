@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       stable_version:
-        description: Published driver version to upgrade from
+        description: Published stable driver version
         required: true
         default: "2026.10.8"
       candidate_version:
@@ -12,11 +12,11 @@ on:
         required: true
         default: "2026.10.9"
       base_target_version:
-        description: Published target for the baseline run
+        description: Published target for the baseline scenario
         required: true
         default: "2026.10.10-beta.3"
       fix_target_version:
-        description: Published target for the reviewed-driver run
+        description: Published target for the reviewed-driver scenario
         required: true
         default: "2026.10.10-beta.4"
 
@@ -25,6 +25,14 @@ permissions:
 
 jobs:
   proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: baseline
+            port: 18833
+          - scenario: fix
+            port: 18834
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -46,12 +54,11 @@ jobs:
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
           sleep 2
           # Restart once the bus socket exists so the manager registers on it
-          # (the managed-service inspection needs org.freedesktop.systemd1).
+          # (managed-service inspection needs org.freedesktop.systemd1).
           sudo systemctl restart "user@$(id -u).service"
           sleep 3
           systemctl --user is-system-running || true
           systemctl --user start dbus.socket 2>/dev/null || true
-          systemctl --user is-active dbus.socket 2>/dev/null || true
           busctl --user list | grep -E "org.freedesktop.systemd1" || echo "systemd1 not on the user bus"
 
       - name: Report reviewed build identity
@@ -60,39 +67,33 @@ jobs:
           curl -fsSL "$GITHUB_API_URL/repos/SunnyShu0925/openclaw/commits/fix/update-managed-service-handoff-lossy-utf8" \
             | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const c=JSON.parse(s);console.log(`reviewed PR head: ${c.sha} ${c.commit?.message?.split("\n")[0]}`)})'
 
-      - name: Run the published-driver to candidate managed upgrades
+      - name: Run the managed update proof (${{ matrix.scenario }})
         env:
+          SCENARIO: ${{ matrix.scenario }}
+          GATEWAY_PORT: ${{ matrix.port }}
           STABLE_VERSION: ${{ inputs.stable_version }}
           CAND_VERSION: ${{ inputs.candidate_version }}
           BASE_TARGET_VERSION: ${{ inputs.base_target_version }}
           FIX_TARGET_VERSION: ${{ inputs.fix_target_version }}
         run: bash "$GITHUB_WORKSPACE/scripts/proof.sh"
 
-      - name: Upload proof logs
+      - name: Upload proof logs (${{ matrix.scenario }})
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: proof-logs
+          name: proof-logs-${{ matrix.scenario }}
           path: |
-            /tmp/update-runA.json
-            /tmp/update-runA.err
-            /tmp/update-runB.json
-            /tmp/update-runB.err
-            /tmp/inject-runA.log
-            /tmp/inject-runB.log
-            /tmp/run-update-runA.sh
-            /tmp/run-update-runB.sh
+            /tmp/update.json
+            /tmp/update.json.err
+            /tmp/update.json.rc
+            /tmp/run-update.sh
+            /tmp/cron-add.err
             /tmp/gateway-status.json
             /tmp/gateway-status-after.json
             /tmp/cron-before.json
-            /tmp/cron-after-a.json
+            /tmp/cron-after.json
             /tmp/proof-summary.txt
-            /tmp/registry-a.log
-            /tmp/registry-b.log
+            /tmp/handoff.log
             /tmp/inject-gateway.log
-            /tmp/handoff-runA.log
-            /tmp/handoff-runB.log
-            /tmp/cron-add-runA.err
-            /tmp/cron-add-runB.err
             /home/runner/.openclaw/update-reports/*.md
           if-no-files-found: warn
