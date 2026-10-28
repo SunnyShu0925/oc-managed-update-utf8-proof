@@ -139,8 +139,8 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p /tmp/proof-artifacts
-          cp /tmp/proof-download/*/openclaw-*.tgz /tmp/proof-artifacts/
-          cp /tmp/proof-download/*/reviewed-build-id.txt /tmp/proof-artifacts/
+          find /tmp/proof-download -name 'openclaw-*.tgz' -exec cp {} /tmp/proof-artifacts/ \;
+          find /tmp/proof-download -name 'reviewed-build-id.txt' -exec cp {} /tmp/proof-artifacts/ \;
           ls -l /tmp/proof-artifacts
 
       - name: Start the systemd user manager
